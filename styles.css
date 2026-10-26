@@ -1008,6 +1008,24 @@ main {
   font-size: 12px;
 }
 
+.checkbox-line {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  color: var(--ink-soft);
+  font-size: 13px;
+  line-height: 1.5;
+  cursor: pointer;
+}
+
+.checkbox-line input[type="checkbox"] {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  margin: 2px 0 0;
+  accent-color: var(--accent);
+}
+
 .form-error {
   margin: 10px 0 0;
   color: var(--danger);

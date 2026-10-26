@@ -144,6 +144,7 @@
   function normalizeState(raw) {
     const out = defaultState();
     if (!raw || typeof raw !== 'object') return out;
+    const today = todayStr();
 
     const seenSubjects = new Set();
     if (Array.isArray(raw.subjects)) {
@@ -192,10 +193,24 @@
           Object.keys(e.done).forEach(function (k) {
             const n = Number(k);
             const v = e.done[k];
-            if (Number.isInteger(n) && n >= 2 && n <= 50 && isValidYmd(v)) {
+            if (Number.isInteger(n) && n >= 1 && n <= 50 && isValidYmd(v)) {
               done[n] = v;
             }
           });
+        }
+
+        // prepared=true 表示预备诵：首次日期还没到，或已经到了但还没完成首次。
+        // 旧数据没有这个字段，首次日期已过时自动视为首次已完成。
+        let prepared = false;
+        if (done[1]) {
+          prepared = false;
+        } else if (e.firstDate > today) {
+          prepared = true;
+        } else if (e.prepared === true) {
+          prepared = true;
+        } else {
+          done[1] = e.firstDate;
+          prepared = false;
         }
 
         seenEntries.add(e.id);
@@ -206,6 +221,7 @@
           firstDate: e.firstDate,
           firstMinutes: firstMinutes,
           done: done,
+          prepared: prepared,
           createdAt: typeof e.createdAt === 'string' ? e.createdAt : nowIso(),
           updatedAt: typeof e.updatedAt === 'string' ? e.updatedAt : undefined,
         });
@@ -327,15 +343,42 @@
   }
 
   function isSessionDone(entry, n) {
-    if (n === 1) return true;
+    if (n === 1) {
+      if (entry.done && entry.done[1]) return true;
+      if (entry.prepared) return false;
+      return entry.firstDate <= todayStr();
+    }
     return !!(entry.done && entry.done[n]);
+  }
+
+  /**
+   * 初始化新条目的复习进度。
+   * - 首次日期在未来：进入预备诵，首次完成前不进入今日清单。
+   * - 首次日期在今天或过去：首次视为已完成；skipPast 为 true 时，
+   *   把所有计划日期早于今天的轮次自动记为完成，只保留今天/之后最近的轮次。
+   */
+  function initializeProgress(entry, skipPast) {
+    const today = todayStr();
+    entry.done = {};
+    if (entry.firstDate > today) {
+      entry.prepared = true;
+      return;
+    }
+    entry.prepared = false;
+    entry.done[1] = entry.firstDate;
+    if (skipPast) {
+      buildPlan(entry).forEach(function (s) {
+        if (s.n > 1 && s.date < today) {
+          entry.done[s.n] = s.date;
+        }
+      });
+    }
   }
 
   function pendingSession(entry, dateStr) {
     const plan = buildPlan(entry);
     for (let i = 0; i < plan.length; i++) {
       const s = plan[i];
-      if (s.n === 1) continue;
       if (isSessionDone(entry, s.n)) continue;
       if (s.date > dateStr) return null;
       return {
@@ -352,7 +395,6 @@
     const plan = buildPlan(entry);
     for (let i = 0; i < plan.length; i++) {
       const s = plan[i];
-      if (s.n === 1) continue;
       if (!isSessionDone(entry, s.n)) return s;
     }
     return null;
@@ -360,17 +402,21 @@
 
   function completedSessionsOn(entry, dateStr) {
     return buildPlan(entry).filter(function (s) {
-      return s.n > 1 && entry.done && entry.done[s.n] === dateStr;
+      return entry.done && entry.done[s.n] === dateStr;
     });
   }
 
   function progressOf(entry) {
     const plan = buildPlan(entry);
-    const doneCount =
-      1 + Object.keys(entry.done || {}).filter(function (k) {
-        return Number(k) >= 2;
-      }).length;
-    return { done: doneCount, total: plan.length };
+    const doneKeys = Object.keys(entry.done || {}).filter(function (k) {
+      return Number(k) >= 1;
+    }).length;
+    const implicitFirst =
+      isSessionDone(entry, 1) && !(entry.done && entry.done[1]);
+    return {
+      done: doneKeys + (implicitFirst ? 1 : 0),
+      total: plan.length,
+    };
   }
 
   function todayPendingRows() {
@@ -726,6 +772,14 @@
           : '这一天没有需要复习的条目';
       desc =
         '可以用上方的日期查看其他日期；条目到复习日期时会自动出现在这里。';
+      const viewDate = ui.date || todayStr();
+      const preparedCount = state.entries.filter(function (e) {
+        return e.prepared && e.firstDate > viewDate;
+      }).length;
+      if (preparedCount) {
+        desc +=
+          ' 另有 ' + preparedCount + ' 条预备诵会在首次日期到达后出现。';
+      }
       button =
         '<button type="button" class="btn no-print" data-action="goto-entries">查看全部条目</button>';
     }
@@ -774,7 +828,7 @@
       '<div class="view-head">' +
       '<div>' +
       '<h1 class="view-title">条目管理</h1>' +
-      '<p class="view-desc">检索、查看、修改或删除条目。修改首次背诵日期或用时会重算后续复习日期，已完成的复习记录会保留。</p>' +
+      '<p class="view-desc">检索、查看、修改或删除条目。修改首次日期会按新日期重置复习进度；只改名称、科目或用时不会重置。</p>' +
       '</div>' +
       '<button type="button" class="btn btn-primary" data-action="new-entry">添加条目</button>' +
       '</div>' +
@@ -897,6 +951,10 @@
         let nextHtml;
         if (!next) {
           nextHtml = '<span class="muted">全部完成</span>';
+        } else if (next.n === 1 && next.date > today) {
+          nextHtml = fmtShort(next.date) + ' <span class="muted">（预备诵）</span>';
+        } else if (next.n === 1 && next.date === today) {
+          nextHtml = fmtShort(next.date) + ' <span class="muted">（今天开始）</span>';
         } else {
           const overdue = next.date < today ? diffDays(next.date, today) : 0;
           nextHtml =
@@ -1111,7 +1169,12 @@
     const root = $('#view-data');
     const activeSubjectCount = activeSubjects().length;
     const doneTotal = state.entries.reduce(function (sum, e) {
-      return sum + Object.keys(e.done || {}).length;
+      return (
+        sum +
+        Object.keys(e.done || {}).filter(function (k) {
+          return Number(k) >= 2;
+        }).length
+      );
     }, 0);
     const pendingToday = todayPendingRows().length;
     const sampleFirst = 15;
@@ -1173,7 +1236,7 @@
       '<table class="rule-table"><thead><tr><th>背诵次数</th><th>安排日期</th><th>建议用时（首次 15 分钟为例）</th></tr></thead><tbody>' +
       sampleRows +
       '</tbody></table>' +
-      '<p class="muted" style="margin-top:10px;font-size:12px">说明：首次背诵视为已完成，从第 2 次开始进入今日复习清单；如果某次复习逾期未完成，会一直保留在清单里并标注逾期天数。</p>' +
+      '<p class="muted" style="margin-top:10px;font-size:12px">说明：首次日期在过去或今天时，首次视为已完成，从第 2 次开始进入今日复习清单；勾选“自动从最近的复习轮次开始”会跳过已过去的轮次。首次日期在未来时作为预备诵，到日期后先完成第 1 次。逾期未完成的复习会一直保留并标注逾期天数。</p>' +
       '</div>' +
       '<div class="panel danger-zone">' +
       '<h2>清空数据</h2>' +
@@ -1282,8 +1345,8 @@
         (entry ? '编辑条目' : '添加条目') +
         '</h2>' +
         (entry
-          ? '<div class="modal-subtitle">修改首次背诵信息会重算后续复习日期。</div>'
-          : '<div class="modal-subtitle">首次背诵当天记为第 1 次，从第 2 天开始安排复习。</div>') +
+          ? '<div class="modal-subtitle">修改首次日期会重置复习进度；只改名称或用时不会。</div>'
+          : '<div class="modal-subtitle">过去日期可自动跳到最近轮次；未来日期作为预备诵。</div>') +
         '</div>' +
         '<button type="button" class="icon-btn" data-close aria-label="关闭">×</button>' +
         '</div>' +
@@ -1298,11 +1361,12 @@
         '</select>' +
         '<p class="hint">想增加新科目？先到「科目设置」里添加。</p></div>' +
         '<div class="field"><label for="entry-date">首次背诵日期</label>' +
-        '<input type="date" class="date-input" id="entry-date" name="firstDate" required max="' +
-        todayStr() +
-        '" value="' +
+        '<input type="date" class="date-input" id="entry-date" name="firstDate" required value="' +
         (entry ? esc(entry.firstDate) : todayStr()) +
-        '"></div>' +
+        '">' +
+        '<p class="hint">可以是过去、今天或未来。未来日期会作为预备诵，到日期后第 1 次才进入复习清单。</p></div>' +
+        '<div class="field"><label class="checkbox-line"><input type="checkbox" name="skipPast" checked> <span>自动从最近的复习轮次开始（跳过已过去的日期）</span></label>' +
+        '<p class="hint">首次日期早于今天时生效：过去的复习轮次会自动记为完成，只保留今天或之后最近的轮次。修改首次日期时也会按这个设置重新初始化。</p></div>' +
         '<div class="field"><label for="entry-minutes">首次记忆用时（分钟）</label>' +
         '<input type="number" class="number-input" id="entry-minutes" name="firstMinutes" min="0.1" max="600" step="0.1" required placeholder="例如：15" value="' +
         (entry ? esc(entry.firstMinutes) : '') +
@@ -1344,21 +1408,37 @@
       return fail('这个科目已停用，请选择其他科目。');
     }
     if (!isValidYmd(firstDate)) return fail('请选择有效的首次背诵日期。');
-    if (firstDate > todayStr()) return fail('首次背诵日期不能晚于今天。');
     if (!Number.isFinite(firstMinutes) || firstMinutes <= 0) {
       return fail('首次记忆用时需要大于 0 分钟。');
     }
     if (firstMinutes > 600) return fail('首次记忆用时不能超过 600 分钟。');
 
+    const skipPast = !!(form.elements.skipPast && form.elements.skipPast.checked);
     let saved;
+    let resetByDate = false;
+
     if (entry) {
+      const dateChanged = entry.firstDate !== firstDate;
+      if (
+        dateChanged &&
+        Object.keys(entry.done || {}).length > 0 &&
+        !confirm('修改首次日期会重置该条目的复习进度，确定保存吗？')
+      ) {
+        return false;
+      }
       entry.name = name;
       entry.subjectId = subject.id;
-      entry.firstDate = firstDate;
       entry.firstMinutes = firstMinutes;
+      if (dateChanged) {
+        entry.firstDate = firstDate;
+        entry.done = {};
+        entry.prepared = false;
+        initializeProgress(entry, skipPast);
+        resetByDate = true;
+      }
       entry.updatedAt = nowIso();
 
-      // 如果修改后的计划变短，清掉超出范围的完成记录
+      // 清理超出当前计划范围的完成记录
       const maxN = buildPlan(entry)[buildPlan(entry).length - 1].n;
       Object.keys(entry.done || {}).forEach(function (k) {
         if (Number(k) > maxN) delete entry.done[k];
@@ -1372,8 +1452,10 @@
         firstDate: firstDate,
         firstMinutes: firstMinutes,
         done: {},
+        prepared: false,
         createdAt: nowIso(),
       };
+      initializeProgress(saved, skipPast);
       state.entries.push(saved);
     }
 
@@ -1382,18 +1464,29 @@
     render();
 
     if (entry) {
-      toast('已保存修改。');
+      toast(
+        resetByDate
+          ? '已保存，并按新日期重置了复习进度。'
+          : '已保存修改。'
+      );
+      return true;
+    }
+
+    const next = nextSession(saved);
+    if (saved.prepared) {
+      toast('已添加预备诵，首次日期：' + fmtShort(saved.firstDate) + '。');
+    } else if (!next) {
+      toast('已添加条目，复习计划已全部完成。');
+    } else if (next.date <= todayStr()) {
+      toast('已从第 ' + next.n + ' 次开始，今天有复习。');
     } else {
-      const next = nextSession(saved);
-      if (!next) {
-        toast('已添加条目。');
-      } else if (next.date === todayStr()) {
-        toast('已添加条目，今天正好有复习安排。');
-      } else if (next.date < todayStr()) {
-        toast('已添加条目，首次复习日期已过，已列入今日清单。');
-      } else {
-        toast('已添加条目，下次复习：' + fmtShort(next.date) + '。');
-      }
+      toast(
+        '已从第 ' +
+          next.n +
+          ' 次开始，下次复习：' +
+          fmtShort(next.date) +
+          '。'
+      );
     }
     return true;
   }
@@ -1416,9 +1509,39 @@
         let cls = '';
         let actionHtml;
         if (s.n === 1) {
-          status = '首次背诵';
-          cls = 'is-done';
-          actionHtml = '<span class="muted">—</span>';
+          const firstDone = entry.done && entry.done[1];
+          if (firstDone) {
+            status = '已完成 ' + fmtShort(firstDone);
+            cls = 'is-done';
+            actionHtml =
+              '<button type="button" class="btn btn-small" data-action="undo-session" data-id="' +
+              esc(entry.id) +
+              '" data-n="1">撤销</button>';
+          } else if (entry.prepared) {
+            if (s.date > today) {
+              status = '预备诵 · ' + fmtShort(s.date) + ' 开始';
+              actionHtml =
+                '<button type="button" class="btn btn-small" disabled>未开始</button>';
+            } else if (s.date < today) {
+              status = '逾期 ' + diffDays(s.date, today) + ' 天';
+              cls = 'is-overdue';
+              actionHtml =
+                '<button type="button" class="btn btn-small btn-primary" data-action="complete-session" data-id="' +
+                esc(entry.id) +
+                '" data-n="1">标记完成</button>';
+            } else {
+              status = '今天开始';
+              actionHtml =
+                '<button type="button" class="btn btn-small btn-primary" data-action="complete-session" data-id="' +
+                esc(entry.id) +
+                '" data-n="1">标记完成</button>';
+            }
+          } else {
+            // 旧数据兼容：首次日期已过、没有显式完成记录，视为首次已完成
+            status = '首次背诵';
+            cls = 'is-done';
+            actionHtml = '<span class="muted">—</span>';
+          }
         } else {
           const doneDate = entry.done && entry.done[s.n];
           if (doneDate) {
@@ -1509,7 +1632,7 @@
         '<tbody>' +
         rows +
         '</tbody></table></div>' +
-        '<p class="detail-note">标记完成会记录为今天完成；逾期的复习可以补记。修改首次背诵信息后，未来复习日期会重新计算。</p>' +
+        '<p class="detail-note">标记完成会记录为今天完成；逾期可以补记。未来首次日期作为预备诵，到日期后再标记首次完成；修改首次日期会重置复习进度。</p>' +
         '</div>' +
         '<div class="modal-foot">' +
         '<button type="button" class="btn btn-small btn-danger foot-left" data-action="reset-entry-progress" data-id="' +
@@ -1681,7 +1804,10 @@
   function completeSession(id, n, doneDate) {
     const entry = findEntry(id);
     if (!entry) return;
-    if (n === 1) return;
+    if (isSessionDone(entry, n)) {
+      toast('这次复习已经完成。');
+      return;
+    }
     const plan = buildPlan(entry);
     const session = plan.find(function (s) {
       return s.n === n;
@@ -1703,15 +1829,38 @@
 
     if (!entry.done) entry.done = {};
     entry.done[n] = date;
+    if (n === 1) entry.prepared = false;
     entry.updatedAt = nowIso();
     saveState();
     render();
-    toast('已完成「' + entry.name + '」第 ' + n + ' 次复习。');
+    toast(
+      n === 1
+        ? '已完成「' + entry.name + '」的首次背诵。'
+        : '已完成「' + entry.name + '」第 ' + n + ' 次复习。'
+    );
   }
 
   function undoSession(id, n) {
     const entry = findEntry(id);
-    if (!entry || !entry.done || !entry.done[n]) return;
+    if (!entry) return;
+    if (n === 1) {
+      if (!entry.done || !entry.done[1]) return;
+      if (
+        !confirm(
+          '撤销首次背诵会清空该条目的所有复习记录，并回到“首次未完成”状态。确定继续吗？'
+        )
+      ) {
+        return;
+      }
+      entry.done = {};
+      entry.prepared = true;
+      entry.updatedAt = nowIso();
+      saveState();
+      render();
+      toast('已撤销首次背诵，复习进度已重置。');
+      return;
+    }
+    if (!entry.done || !entry.done[n]) return;
     delete entry.done[n];
     entry.updatedAt = nowIso();
     saveState();
@@ -1722,16 +1871,22 @@
   function resetEntryProgress(id) {
     const entry = findEntry(id);
     if (!entry) return;
-    if (
-      !confirm(
-        '确定清空「' +
-          entry.name +
-          '」的所有复习记录吗？首次背诵记录会保留，后续复习会重新开始。'
-      )
-    ) {
+    const isFuture = entry.firstDate > todayStr();
+    const message = isFuture
+      ? '确定重置「' + entry.name + '」的复习进度吗？'
+      : '确定清空「' +
+        entry.name +
+        '」的复习记录吗？首次背诵记录会保留，后续复习会重新开始。';
+    if (!confirm(message)) {
       return;
     }
     entry.done = {};
+    if (isFuture) {
+      entry.prepared = true;
+    } else {
+      entry.done[1] = entry.firstDate;
+      entry.prepared = false;
+    }
     entry.updatedAt = nowIso();
     saveState();
     render();
@@ -1900,15 +2055,22 @@
       ['政治 马原 认识论', 3, -2, 27, []],
       ['政治 思修 基础', 3, -1, 18, [2]],
       ['政治 当代 专题', 3, 0, 15, []],
+      // 预备诵示例：首次日期在未来，到日期后才进入复习
+      ['英语单词 Unit 5（预备）', 0, 2, 20, [], true],
+      ['数学 预备章节（预备）', 1, 3, 25, [], true],
     ];
 
     const entries = items.map(function (item, index) {
       const firstDate = addDays(today, item[2]);
+      const isPrepared = item[5] === true;
       const done = {};
-      item[4].forEach(function (n) {
-        done[n] =
-          addDays(firstDate, Math.round(Math.pow(SESSION_BASE, n - 1)) - 1);
-      });
+      if (!isPrepared) {
+        done[1] = firstDate;
+        item[4].forEach(function (n) {
+          done[n] =
+            addDays(firstDate, Math.round(Math.pow(SESSION_BASE, n - 1)) - 1);
+        });
+      }
       return {
         id: 'e_demo_' + index,
         name: item[0],
@@ -1916,6 +2078,7 @@
         firstDate: firstDate,
         firstMinutes: item[3],
         done: done,
+        prepared: isPrepared,
         createdAt: new Date(Date.now() - index * 60000).toISOString(),
       };
     });
